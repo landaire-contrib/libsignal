@@ -107,7 +107,8 @@ signal-neon-futures = { path = "rust/bridge/node/futures" }
 # that want to use the real things can depend on those directly.
 
 boring-signal = { git = "https://github.com/signalapp/boring", tag = "signal-v5.4.0", package = "boring", default-features = false }
-spqr = { git = "https://github.com/signalapp/SparsePostQuantumRatchet.git", tag = "v1.7.0" }
+# The fork compiles its schemas with protox. Its `lume` branch is upstream v1.7.0 plus that change.
+spqr = { git = "https://github.com/landaire-contrib/SparsePostQuantumRatchet.git", branch = "lume" }
 tokio-boring-signal = { git = "https://github.com/signalapp/boring", tag = "signal-v5.4.0", package = "tokio-boring" }
 
 aes = "0.9.1"
@@ -202,6 +203,7 @@ proptest-state-machine = "0.4"
 prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
+protox = "0.10"
 protobuf = "3.7.2"
 protobuf-codegen = "3.7.2"
 quote = "1.0.40"

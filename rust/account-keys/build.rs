@@ -20,7 +20,8 @@ fn main() {
 
     protobuf_codegen::Codegen::new()
         .customize(Customize::default().lite_runtime(true))
-        .protoc()
+        // The pure Rust parser, so the build does not need a protoc binary.
+        .pure()
         .include("src")
         .inputs(PROTOS)
         .out_dir(&out_dir)

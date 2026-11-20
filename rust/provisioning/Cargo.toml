@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
+protox = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
