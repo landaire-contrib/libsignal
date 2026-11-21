@@ -21,13 +21,14 @@ test-util = []
 libsignal-core = { workspace = true }
 
 asn1 = { workspace = true }
+base64 = { workspace = true }
 bitflags = { workspace = true }
 blake2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 ciborium = { workspace = true }
 const-str = { workspace = true }
-der = { workspace = true, features = ["alloc", "derive", "oid", "pem"] }
+der = { workspace = true, features = ["alloc", "derive", "oid"] }
 displaydoc = { workspace = true }
 graviola = { workspace = true }
 hex = { workspace = true, features = ["serde"] }

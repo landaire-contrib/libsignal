@@ -8,6 +8,7 @@
 use std::ops::Range;
 use std::time::SystemTime;
 
+use base64::Engine as _;
 use der::asn1::BitString;
 use der::oid::ObjectIdentifier;
 use der::oid::db::rfc5912;
@@ -48,6 +49,8 @@ impl Certificate {
     }
 
     /// Parses every `CERTIFICATE` PEM block in `data`, ignoring text around the blocks.
+    ///
+    /// The base64 text may be wrapped at any width.
     pub fn from_pem_chain(data: &[u8]) -> Result<Vec<Self>> {
         const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
         const END: &[u8] = b"-----END CERTIFICATE-----";
@@ -55,16 +58,18 @@ impl Certificate {
         let mut certs = Vec::new();
         let mut rest = data;
         while let Some(start) = find(rest, BEGIN) {
-            let block = &rest[start..];
-            let end = find(block, END).ok_or_else(|| Error::new("unterminated PEM certificate"))?
-                + END.len();
-            let (label, der) = der::pem::decode_vec(&block[..end])
+            let block = &rest[start + BEGIN.len()..];
+            let end = find(block, END).ok_or_else(|| Error::new("unterminated PEM certificate"))?;
+            let base64_text: Vec<u8> = block[..end]
+                .iter()
+                .copied()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .collect();
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(base64_text)
                 .map_err(|e| Error::new(format!("invalid PEM certificate: {e}")))?;
-            if label != "CERTIFICATE" {
-                return Err(Error::new(format!("unexpected PEM label {label}")));
-            }
             certs.push(Self::from_der(der)?);
-            rest = &block[end..];
+            rest = &block[end + END.len()..];
         }
 
         Ok(certs)
