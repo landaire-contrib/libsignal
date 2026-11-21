@@ -28,6 +28,7 @@ mod error;
 mod expireable;
 mod proto;
 mod util;
+mod x509;
 
 /// Newtype wrapper for snow::Error for the purposes of logging.
 /// See `libsignal_core::LogSafeDisplay`.

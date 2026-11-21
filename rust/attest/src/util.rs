@@ -3,11 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::time::SystemTime;
-
-use boring_signal::asn1::Asn1Time;
-use libc::time_t;
-
 use crate::constants::{ACCEPTABLE_SW_ADVISORIES, DEFAULT_SW_ADVISORIES};
 
 /// A replacement for [`std::collections::HashMap`] that performs linear lookups.
@@ -78,24 +73,6 @@ pub(crate) fn read_array<const N: usize>(bytes: &mut &[u8]) -> [u8; N] {
     res.copy_from_slice(front);
     *bytes = rest;
     res
-}
-
-#[derive(Debug)]
-pub(crate) struct FailedToConvertToAsn1Time;
-
-pub(crate) fn system_time_to_asn1_time(
-    timestamp: SystemTime,
-) -> Result<Asn1Time, FailedToConvertToAsn1Time> {
-    let epoch_duration = timestamp
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| FailedToConvertToAsn1Time)?;
-
-    let t: time_t = epoch_duration
-        .as_secs()
-        .try_into()
-        .map_err(|_| FailedToConvertToAsn1Time)?;
-
-    Asn1Time::from_unix(t).map_err(|_| FailedToConvertToAsn1Time)
 }
 
 pub fn get_sw_advisories(enclave_id: &[u8]) -> &[&str] {

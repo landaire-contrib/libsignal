@@ -10,9 +10,6 @@
 //! see <https://api.portal.trustedservices.intel.com/documentation>
 use std::time::SystemTime;
 
-use boring_signal::ec::EcKeyRef;
-use boring_signal::ecdsa::{EcdsaSig, EcdsaSigRef};
-use boring_signal::pkey::Public;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -20,12 +17,13 @@ use strum::EnumCount;
 
 use crate::cert_chain::CertChain;
 use crate::constants::SGX_TCB_EVALUATION_DATA_NUMBER_MIN;
-use crate::dcap::ecdsa::{EcdsaSigned, deserialize_ecdsa_signature};
+use crate::dcap::ecdsa::{EcdsaSignature, EcdsaSigned, deserialize_ecdsa_signature};
 use crate::dcap::revocation_list::RevocationList;
 use crate::dcap::{Error, Expireable, Result};
 use crate::endian::UInt32LE;
 use crate::error::Context;
 use crate::util;
+use crate::x509::PublicKey;
 
 #[cfg(any(test, feature = "test-util"))]
 #[used]
@@ -169,7 +167,7 @@ impl TryFrom<&[u8]> for SgxEndorsements {
             pem_chain_for_field(SgxEndorsementField::PckCrlIssuerChain, &offsets, data)?;
 
         let tcb_info = tcb_info.into_tcb_info(
-            &*tcb_issuer_chain
+            &tcb_issuer_chain
                 .leaf_pub_key()
                 .context("tcb issuer chain")?,
         )?;
@@ -180,7 +178,7 @@ impl TryFrom<&[u8]> for SgxEndorsements {
         let qe_id_issuer_chain =
             pem_chain_for_field(SgxEndorsementField::QeIdIssuerChain, &offsets, data)?;
         let qe_id_info = qe_id_info.into_enclave_identity(
-            &*qe_id_issuer_chain
+            &qe_id_issuer_chain
                 .leaf_pub_key()
                 .context("qe identity issuer chain")?,
         )?;
@@ -367,7 +365,7 @@ struct TcbInfoAndSignature<'a> {
     #[serde(rename = "tcbInfo", borrow)]
     tcb_info_raw: &'a RawValue,
     #[serde(deserialize_with = "deserialize_ecdsa_signature")]
-    signature: EcdsaSig,
+    signature: EcdsaSignature,
 }
 
 impl<'a> EcdsaSigned for TcbInfoAndSignature<'a> {
@@ -375,13 +373,13 @@ impl<'a> EcdsaSigned for TcbInfoAndSignature<'a> {
         self.tcb_info_raw.get().as_bytes()
     }
 
-    fn signature(&self) -> &EcdsaSigRef {
+    fn signature(&self) -> &EcdsaSignature {
         &self.signature
     }
 }
 
 impl TcbInfoAndSignature<'_> {
-    fn into_tcb_info(self, public_key: &EcKeyRef<Public>) -> Result<TcbInfo> {
+    fn into_tcb_info(self, public_key: &PublicKey) -> Result<TcbInfo> {
         self.verify_signature(public_key).context("tcb info")?;
         let tcb_info: TcbInfo = serde_json::from_str(self.tcb_info_raw.get())
             .map_err(|e| Error::from(e).context("tcb info"))?;
@@ -615,7 +613,7 @@ struct QuotingEnclaveIdentityAndSignature<'a> {
     #[serde(borrow, rename = "enclaveIdentity")]
     enclave_identity_raw: &'a RawValue,
     #[serde(deserialize_with = "deserialize_ecdsa_signature")]
-    signature: EcdsaSig,
+    signature: EcdsaSignature,
 }
 
 impl<'a> EcdsaSigned for QuotingEnclaveIdentityAndSignature<'a> {
@@ -623,13 +621,13 @@ impl<'a> EcdsaSigned for QuotingEnclaveIdentityAndSignature<'a> {
         self.enclave_identity_raw.get().as_bytes()
     }
 
-    fn signature(&self) -> &EcdsaSigRef {
+    fn signature(&self) -> &EcdsaSignature {
         &self.signature
     }
 }
 
 impl QuotingEnclaveIdentityAndSignature<'_> {
-    fn into_enclave_identity(self, public_key: &EcKeyRef<Public>) -> Result<EnclaveIdentity> {
+    fn into_enclave_identity(self, public_key: &PublicKey) -> Result<EnclaveIdentity> {
         self.verify_signature(public_key)?;
         let identity: EnclaveIdentity = serde_json::from_str(self.enclave_identity_raw.get())
             .map_err(|e| Error::from(e).context("enclave identity"))?;

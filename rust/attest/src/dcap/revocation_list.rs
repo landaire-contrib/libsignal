@@ -3,47 +3,46 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::collections::HashSet;
 use std::time::SystemTime;
 
-use boring_signal::nid::Nid;
-use boring_signal::x509::crl::{X509CRL, X509CRLRef};
+use der::oid::db::rfc5912;
+use der::{Reader, SliceReader};
 
 use crate::dcap::{Error, Expireable, Result};
+use crate::error::Context;
+use crate::x509::Crl;
 
 #[derive(Debug)]
 pub(crate) struct RevocationList {
-    crl: X509CRL,
+    crl: Crl,
 }
 
 impl Expireable for RevocationList {
     fn valid_at(&self, timestamp: SystemTime) -> bool {
-        crate::util::system_time_to_asn1_time(timestamp)
-            .ok()
-            .zip(self.crl.next_update())
-            .and_then(|(now, next_update)| now.compare(next_update).ok())
-            .map(|order| order.is_lt())
-            .unwrap_or(false)
+        self.crl
+            .next_update()
+            .is_some_and(|next_update| timestamp < next_update.to_system_time())
     }
 }
 
 impl RevocationList {
+    /// Parses the DER CRL at the start of `data`. Collateral fields carry a trailing NUL, so
+    /// bytes after the CRL are ignored.
     pub fn from_der_data(data: &[u8]) -> Result<RevocationList> {
-        let crl = X509CRL::from_der(data)?;
+        let mut reader = SliceReader::new(data)?;
+        let crl = reader.tlv_bytes()?;
+        let crl = Crl::from_der(crl.to_vec()).context("CRL")?;
 
         // all RFC 5280 CRLs should have authority key
         // identifiers and a CRL number
-        let nids: HashSet<Nid> = crl
-            .extensions()
-            .map(|extensions| {
-                extensions
-                    .iter()
-                    .map(|extension| extension.object().nid())
-                    .collect()
-            })
-            .unwrap_or_else(HashSet::new);
-
-        if !nids.contains(&Nid::AUTHORITY_KEY_IDENTIFIER) || !nids.contains(&Nid::CRL_NUMBER) {
+        let has_extension = |oid| {
+            crl.extensions()
+                .iter()
+                .any(|extension| extension.extn_id == oid)
+        };
+        if !has_extension(rfc5912::ID_CE_AUTHORITY_KEY_IDENTIFIER)
+            || !has_extension(rfc5912::ID_CE_CRL_NUMBER)
+        {
             return Err(Error::new("CRL missing required extension"));
         }
 
@@ -51,11 +50,11 @@ impl RevocationList {
     }
 
     #[cfg(test)]
-    pub fn from_crl(crl: X509CRL) -> RevocationList {
+    pub fn from_crl(crl: Crl) -> RevocationList {
         RevocationList { crl }
     }
 
-    pub fn crl(&self) -> &X509CRLRef {
-        self.crl.as_ref()
+    pub fn crl(&self) -> &Crl {
+        &self.crl
     }
 }

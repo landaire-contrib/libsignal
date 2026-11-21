@@ -10,14 +10,10 @@
 use std::collections::HashMap;
 
 use asn1::{ObjectIdentifier, SequenceOf, oid};
-use boring_signal::asn1::Asn1ObjectRef;
-use boring_signal::nid::Nid;
 
 use crate::dcap::{Error, Result};
 use crate::error::Context;
 
-pub const SGX_EXTENSIONS_OID: &str = "1.2.840.113741.1.13.1";
-const _SGX_EXTENSIONS_OID_OID: ObjectIdentifier = oid!(1, 2, 840, 113741, 1, 13, 1);
 const PPID_OID: ObjectIdentifier = oid!(1, 2, 840, 113741, 1, 13, 1, 1);
 
 const TCB_OID: ObjectIdentifier = oid!(1, 2, 840, 113741, 1, 13, 1, 2);
@@ -72,11 +68,9 @@ pub(crate) struct SgxPckExtension {
 }
 
 impl SgxPckExtension {
-    /// Whether the `asn_object` a top-level SgxPckExtension
-    pub fn is_pck_ext(asn_object: &Asn1ObjectRef) -> bool {
-        // check for SGX custom oid
-        asn_object.nid() == Nid::UNDEF && asn_object.oid_string() == SGX_EXTENSIONS_OID
-    }
+    /// The OID of the top-level SGX extension on the PCK certificate
+    pub const OID: der::oid::ObjectIdentifier =
+        der::oid::ObjectIdentifier::new_unwrap("1.2.840.113741.1.13.1");
 
     pub fn from_der(der: &[u8]) -> Result<SgxPckExtension> {
         let mut ppid = None;

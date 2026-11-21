@@ -25,20 +25,10 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
-use boring_signal::asn1::{Asn1Time, Asn1TimeRef};
-use boring_signal::bn::BigNumContext;
-use boring_signal::ec::*;
-use boring_signal::error::ErrorStack;
-use boring_signal::nid::Nid;
-use boring_signal::pkey::{PKey, PKeyRef, Public};
-use boring_signal::x509::crl::X509CRLRef;
-use boring_signal::x509::store::{X509Store, X509StoreBuilder};
-use boring_signal::x509::verify::X509VerifyFlags;
-use boring_signal::x509::{X509, X509Ref};
 use hex::ToHex;
 use uuid::Uuid;
 
-use crate::cert_chain::CertChain;
+use crate::cert_chain::{CertChain, Revocation, TrustStore};
 use crate::dcap::ecdsa::EcdsaSigned;
 use crate::dcap::endorsements::{
     EnclaveType, QeTcbStatus, SgxEndorsements, TcbInfo, TcbLevel, TcbStatus,
@@ -50,6 +40,7 @@ use crate::dcap::sgx_x509::SgxPckExtension;
 use crate::enclave::AttestationError;
 use crate::error::{Context, ContextError};
 use crate::expireable::Expireable;
+use crate::x509::{Certificate, Crl, PublicKey};
 
 mod ecdsa;
 mod endorsements;
@@ -127,14 +118,9 @@ pub fn attestation_metrics(
     let endorsements =
         endorsements::SgxEndorsements::try_from(endorsement_bytes).context("endorsements")?;
 
-    fn asn2unix(ts: &Asn1TimeRef) -> std::result::Result<i64, AttestationError> {
-        let diff = Asn1Time::from_unix(0)
-            .expect("0 is valid unix time")
-            .diff(ts)
+    fn asn2unix(ts: x509_cert::time::Time) -> std::result::Result<i64, AttestationError> {
+        let secs = i64::try_from(ts.to_unix_duration().as_secs())
             .map_err(|e| Error::from(e).context("converting attestation timestamps"))?;
-
-        const DAY_SECS: i64 = 24 * 60 * 60;
-        let secs: i64 = diff.days as i64 * DAY_SECS + diff.secs as i64;
         Ok(secs)
     }
     let pck_crl = endorsements.pck_issuer_crl.crl();
@@ -165,18 +151,12 @@ pub fn attestation_metrics(
             "root_not_after_ts",
             asn2unix(endorsements.tcb_issuer_chain.root().not_after())?,
         ),
-        (
-            "pck_crl_last_update_ts",
-            pck_crl.last_update().map_or(Ok(0), asn2unix)?,
-        ),
+        ("pck_crl_last_update_ts", asn2unix(pck_crl.this_update())?),
         (
             "pck_crl_next_update_ts",
             pck_crl.next_update().map_or(Ok(0), asn2unix)?,
         ),
-        (
-            "root_crl_last_update_ts",
-            root_crl.last_update().map_or(Ok(0), asn2unix)?,
-        ),
+        ("root_crl_last_update_ts", asn2unix(root_crl.this_update())?),
         (
             "root_crl_next_update_ts",
             root_crl.next_update().map_or(Ok(0), asn2unix)?,
@@ -225,7 +205,7 @@ fn attest(
 fn attest_impl(
     evidence: Evidence,
     endorsements: SgxEndorsements,
-    trusted_root_pkey: &PKeyRef<Public>,
+    trusted_root_pkey: &PublicKey,
     current_time: SystemTime,
 ) -> Result<Attestation> {
     // 1. Verify the integrity of the signature chain from the Quote to the Intel-issued PCK certificate.
@@ -263,25 +243,16 @@ fn attest_impl(
 }
 
 const INTEL_QE_VENDOR_ID: Uuid = uuid::uuid!("939a7233-f79c-4ca9-940a-0db3957f0607");
-static INTEL_PKEY: LazyLock<PKey<Public>> = LazyLock::new(|| {
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("allocate curve");
-    let mut ctx = BigNumContext::new().expect("allocate bignum");
-    let point = EcPoint::from_bytes(&group, INTEL_ROOT_PUB_KEY, &mut ctx)
-        .expect("static intel key should parse");
-    let trusted_root_pubkey = EcKey::from_public_key(&group, &point).expect("should convert");
-    PKey::from_ec_key(trusted_root_pubkey).expect("ec key should convert")
+static INTEL_PKEY: LazyLock<PublicKey> = LazyLock::new(|| {
+    PublicKey::p256_from_x962_uncompressed(INTEL_ROOT_PUB_KEY)
+        .expect("static intel key should parse")
 });
-
-fn first_subject_entry(cert: &X509, nid: Nid) -> Option<String> {
-    let entry = cert.subject_name().entries_by_nid(nid).next()?;
-    entry.data().as_utf8().map(|x| x.to_string()).ok()
-}
 
 fn verify_issuer_cn(certchain: &CertChain, cn: &str) -> Result<()> {
     let issuer = certchain
         .idx_from_root(1)
         .ok_or_else(|| ContextError::new("issuer chain too short"))?;
-    if first_subject_entry(issuer, Nid::COMMONNAME).is_some_and(|x| x == cn) {
+    if issuer.common_name().is_some_and(|x| x == cn) {
         Ok(())
     } else {
         Err(ContextError::new(format!(
@@ -293,16 +264,16 @@ fn verify_issuer_cn(certchain: &CertChain, cn: &str) -> Result<()> {
 /// Verify that the various certificate chains and CRLs are rooted
 /// in `trusted_pkey`
 fn verify_certificates(
-    trusted_pkey: &PKeyRef<Public>,
+    trusted_pkey: &PublicKey,
     evidence: &Evidence,
     endorsements: &SgxEndorsements,
     current_time: SystemTime,
 ) -> Result<()> {
-    let root_ca: &X509 = endorsements.tcb_issuer_chain.root();
+    let root_ca: &Certificate = endorsements.tcb_issuer_chain.root();
     let root_crl = endorsements.root_crl.crl();
 
-    let trusted = root_trust_store(root_ca, root_crl, trusted_pkey, current_time)
-        .context("root trust store")?;
+    verify_root(root_ca, root_crl, trusted_pkey).context("root trust store")?;
+    let trusted = TrustStore::new(root_ca, Revocation::Required(vec![root_crl]), current_time);
 
     // Intel uses a single root-level key with multiple issuing
     // keys one level down.  Make sure we're seeing the correct
@@ -327,12 +298,11 @@ fn verify_certificates(
         .pck_issuer_crl_chain
         .validate_chain(&trusted, &[endorsements.pck_issuer_crl.crl()])
         .context("pck crl")?;
-    let trusted = from_trusted(
-        &[root_ca],
-        &[root_crl, endorsements.pck_issuer_crl.crl()],
+    let trusted = TrustStore::new(
+        root_ca,
+        Revocation::Required(vec![root_crl, endorsements.pck_issuer_crl.crl()]),
         current_time,
-    )
-    .context("trust store with PCK crl")?;
+    );
 
     // validate all remaining certificates (steps 1 and 2)
     endorsements
@@ -352,64 +322,27 @@ fn verify_certificates(
     Ok(())
 }
 
-/// Create a trust store including the root certificate and crl, if they have been signed by the
-/// root public key
-fn root_trust_store(
-    root_ca: &X509Ref,
-    root_crl: &X509CRLRef,
-    root_key: &PKeyRef<Public>,
-    current_time: SystemTime,
-) -> Result<X509Store> {
+/// Verify that the root certificate and crl have been signed by the root public key
+fn verify_root(root_ca: &Certificate, root_crl: &Crl, root_key: &PublicKey) -> Result<()> {
     // should be self issued
-    if root_ca.issued(root_ca).is_err() {
+    if !root_ca.is_self_issued() {
         return Err(Error::new("Invalid root certificate (not self signed)"));
     }
 
     // should be signed with known root key
-    if !root_ca.verify(root_key).unwrap_or(false) {
+    if root_ca.verify_signature(root_key).is_err() {
         #[cfg(not(fuzzing))]
         return Err(Error::new(
             "Invalid root certificate (not signed by root pub key)",
         ));
     }
 
-    if !root_crl.verify(root_key).unwrap_or(false) {
+    if root_crl.verify_signature(root_key).is_err() {
         #[cfg(not(fuzzing))]
         return Err(Error::new("Root CRL failed verification"));
     }
-    from_trusted(&[root_ca], &[root_crl], current_time)
-}
 
-/// Create a trust store from previously validated certificates and crls
-pub(crate) fn from_trusted(
-    trusted_certs: &[&X509Ref],
-    trusted_crls: &[&X509CRLRef],
-    current_time: SystemTime,
-) -> Result<X509Store> {
-    let build = || -> std::result::Result<X509Store, ErrorStack> {
-        let mut store_builder = X509StoreBuilder::new().expect("can make a fresh X509StoreBuilder");
-        store_builder.param_mut().set_flags(
-            X509VerifyFlags::CRL_CHECK
-                | X509VerifyFlags::CRL_CHECK_ALL
-                | X509VerifyFlags::X509_STRICT,
-        );
-        store_builder.param_mut().set_time(
-            current_time
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("current time is after 1970")
-                .as_secs()
-                .try_into()
-                .expect("haven't yet overflowed time_t"),
-        );
-        for &cert in trusted_certs {
-            store_builder.add_cert(cert)?;
-        }
-        for &crl in trusted_crls {
-            store_builder.add_crl(crl.to_owned())?;
-        }
-        Ok(store_builder.build())
-    };
-    build().map_err(|e| Error::from(e).context("building trusted certificate store"))
+    Ok(())
 }
 
 fn verify_expiration(timestamp: SystemTime, expireable: &dyn Expireable) -> Result<()> {
@@ -533,7 +466,7 @@ fn verify_enclave_signatures(evidence: &Evidence) -> Result<()> {
         .context("QE report")?;
 
     // and finally, the isv report should be signed by the attest key in the quote
-    let attest_key = &*evidence
+    let attest_key = &evidence
         .quote
         .support
         .attest_key()
@@ -672,8 +605,8 @@ mod test {
 
     use std::time::{Duration, SystemTime};
 
-    use boring_signal::bn::BigNum;
     use prost::Message;
+    use x509_cert::serial_number::SerialNumber;
 
     use super::*;
     use crate::cert_chain::testutil::TestCert;
@@ -940,10 +873,9 @@ mod test {
     fn revoked_pck() {
         let mut builder = FakeAttestation::builder();
         let to_revoke = builder.signing_info.pck_chain[0]
-            .x509
+            .cert
             .serial_number()
-            .to_bn()
-            .unwrap();
+            .clone();
         builder.signing_info.revoke_from_pck(to_revoke);
         assert!(builder.sign().attest().is_err());
     }
@@ -954,7 +886,7 @@ mod test {
         // revoke some other certificate
         builder
             .signing_info
-            .revoke_from_pck(BigNum::from_u32(0u32).unwrap());
+            .revoke_from_pck(SerialNumber::new(&[0]).unwrap());
         builder.sign().attest().unwrap();
     }
 
@@ -964,7 +896,7 @@ mod test {
         // revoke some other certificate
         builder
             .signing_info
-            .revoke_from_root(BigNum::from_u32(0u32).unwrap());
+            .revoke_from_root(SerialNumber::new(&[0]).unwrap());
         builder.sign().attest().unwrap();
     }
 
@@ -972,10 +904,9 @@ mod test {
     fn revoked_tcb_signer() {
         let mut builder = FakeAttestation::builder();
         let to_revoke = builder.signing_info.tcb_issuer_chain[0]
-            .x509
+            .cert
             .serial_number()
-            .to_bn()
-            .unwrap();
+            .clone();
         builder.signing_info.revoke_from_root(to_revoke);
         assert!(builder.sign().attest().is_err());
     }
@@ -984,10 +915,9 @@ mod test {
     fn revoked_qe_id_signer() {
         let mut builder = FakeAttestation::builder();
         let to_revoke = builder.signing_info.qe_id_issuer_chain[0]
-            .x509
+            .cert
             .serial_number()
-            .to_bn()
-            .unwrap();
+            .clone();
         builder.signing_info.revoke_from_root(to_revoke);
         assert!(builder.sign().attest().is_err());
     }
@@ -1138,12 +1068,9 @@ mod test {
     /// order (`FakeAttestation` skips parsing) and that the result passes the issuer CN check,
     /// so only chain validation is left to reject it.
     fn assert_parses_as_tcb_signing_chain(certs: &[TestCert]) {
-        let parsed = CertChain::new(certs.iter().map(|c| c.x509.clone())).expect("valid by name");
+        let parsed = CertChain::new(certs.iter().map(|c| c.cert.clone())).expect("valid by name");
         for (idx, cert) in certs.iter().rev().enumerate() {
-            assert_eq!(
-                parsed.idx_from_root(idx).unwrap().to_der().unwrap(),
-                cert.x509.to_der().unwrap()
-            );
+            assert_eq!(parsed.idx_from_root(idx).unwrap().der(), cert.cert.der());
         }
         verify_issuer_cn(&parsed, "Intel SGX TCB Signing").expect("CN matches");
     }
@@ -1160,13 +1087,12 @@ mod test {
         //   root <- fake TCB <- fake root <- PCK CA <- PCK leaf
         //
         // The cert right below the root is named "Intel SGX TCB Signing", so the issuer CN check
-        // passes. BoringSSL doesn't use the two fake certs: its verified path goes from the PCK
-        // CA straight to the root. This checks that `validate_chain` rejects the chain when the
-        // path BoringSSL verifies from the leaf to the trusted root leaves out some of the
-        // chain's certs.
+        // passes. A path built from the leaf doesn't use the two fake certs: it goes from the
+        // PCK CA straight to the root. This checks that `validate_chain` rejects the chain when
+        // the path from the leaf to the trusted root leaves out some of the chain's certs.
         let mut builder = FakeAttestation::builder();
         let signing_info = &builder.signing_info;
-        let root_cn = first_subject_entry(&signing_info.root.x509, Nid::COMMONNAME).unwrap();
+        let root_cn = signing_info.root.cert.common_name().unwrap();
 
         let fake_tcb = signing_info.root.forge("Intel SGX TCB Signing");
         let fake_root = fake_tcb.forge(&root_cn);
@@ -1195,12 +1121,12 @@ mod test {
         //   root <- fake TCB <- fake root <- root <- PCK CA <- PCK leaf
         //
         // `CertChain::sort` treats the last self-issued cert as the root, so the issuer CN check
-        // passes, and so does the check of the chain's root against the trusted key. BoringSSL's
-        // verified path stops at the first copy of the root, so it is a shorter version of the
+        // passes, and so does the check of the chain's root against the trusted key. A path built
+        // from the leaf stops at the first copy of the root, so it is a shorter version of the
         // supplied chain. This checks that `validate_chain` also compares the lengths.
         let mut builder = FakeAttestation::builder();
         let signing_info = &builder.signing_info;
-        let root_cn = first_subject_entry(&signing_info.root.x509, Nid::COMMONNAME).unwrap();
+        let root_cn = signing_info.root.cert.common_name().unwrap();
 
         let fake_tcb = signing_info.root.forge("Intel SGX TCB Signing");
         let fake_root = fake_tcb.forge(&root_cn);
@@ -1232,7 +1158,7 @@ mod test {
         // This checks that the length comparison covers the QE identity chain too.
         let mut builder = FakeAttestation::builder();
         let signing_info = &builder.signing_info;
-        let root_cn = first_subject_entry(&signing_info.root.x509, Nid::COMMONNAME).unwrap();
+        let root_cn = signing_info.root.cert.common_name().unwrap();
 
         let untrusted_root = TestCert::self_issued("untrusted root");
         let fake_tcb = untrusted_root.issue("Intel SGX TCB Signing");

@@ -14,23 +14,20 @@
 
 use std::time::SystemTime;
 
-use boring_signal::asn1::{Asn1Integer, Asn1IntegerRef};
-use boring_signal::bn::{BigNum, BigNumContext};
-use boring_signal::ec::{EcGroup, EcKey, EcKeyRef};
-use boring_signal::ecdsa::EcdsaSig;
-use boring_signal::hash::{Hasher, MessageDigest};
-use boring_signal::nid::Nid;
-use boring_signal::pkey::{PKey, Private, Public};
 use chrono::Utc;
+use graviola::signing::ecdsa::{P256, SigningKey};
+use sha2::Digest;
+use x509_cert::serial_number::SerialNumber;
 
 use crate::cert_chain::CertChain;
-use crate::cert_chain::testutil::TestCert;
+use crate::cert_chain::testutil::{TestCert, generate_key, public_point, sign_fixed};
 use crate::constants::SGX_TCB_EVALUATION_DATA_NUMBER_MIN;
-use crate::dcap::ecdsa::EcdsaSigned;
+use crate::dcap::ecdsa::{EcdsaSignature, EcdsaSigned};
 use crate::dcap::endorsements::SgxEndorsements;
 use crate::dcap::evidence::Evidence;
 use crate::dcap::revocation_list::RevocationList;
 use crate::dcap::{Attestation, attest_impl};
+use crate::x509::PublicKey;
 
 const EVIDENCE_BYTES: &[u8] = include_bytes!("../../tests/data/dcap.evidence");
 const ENDORSEMENT_BYTES: &[u8] = include_bytes!("../../tests/data/dcap.endorsements");
@@ -41,27 +38,22 @@ pub(crate) struct SigningInfo {
     pub pck_issuer_crl_chain: Vec<TestCert>,
     pub tcb_issuer_chain: Vec<TestCert>,
     pub qe_id_issuer_chain: Vec<TestCert>,
-    pub attest_key: EcKey<Private>,
-    pub root_revoked: Vec<BigNum>,
-    pub pck_revoked: Vec<BigNum>,
+    pub attest_key: SigningKey<P256>,
+    pub root_revoked: Vec<SerialNumber>,
+    pub pck_revoked: Vec<SerialNumber>,
 }
 
 impl SigningInfo {
-    pub fn revoke_from_root(&mut self, revoked: BigNum) {
+    pub fn revoke_from_root(&mut self, revoked: SerialNumber) {
         self.root_revoked.push(revoked);
     }
 
-    pub fn revoke_from_pck(&mut self, revoked: BigNum) {
+    pub fn revoke_from_pck(&mut self, revoked: SerialNumber) {
         self.pck_revoked.push(revoked);
     }
 
-    fn crl(cert: &TestCert, revoked: &[BigNum]) -> RevocationList {
-        let revoked_sns: Vec<Asn1Integer> = revoked
-            .iter()
-            .map(|sn| sn.to_asn1_integer().unwrap())
-            .collect();
-        let revoked: Vec<&Asn1IntegerRef> = revoked_sns.iter().map(Asn1Integer::as_ref).collect();
-        RevocationList::from_crl(cert.crl(&revoked))
+    fn crl(cert: &TestCert, revoked: &[SerialNumber]) -> RevocationList {
+        RevocationList::from_crl(cert.crl(revoked))
     }
 
     fn root_crl(&self) -> RevocationList {
@@ -72,19 +64,10 @@ impl SigningInfo {
         Self::crl(&self.pck_issuer_crl_chain[0], &self.pck_revoked)
     }
 
+    /// The attest public key as the raw coordinates `x || y`.
     fn serialize_attest_public_key(&self) -> [u8; 64] {
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let mut xbn = BigNum::new().unwrap();
-        let mut ybn = BigNum::new().unwrap();
-        let mut ctx = BigNumContext::new().unwrap();
-        self.attest_key
-            .public_key()
-            .affine_coordinates_gfp(&group, &mut xbn, &mut ybn, &mut ctx)
-            .unwrap();
-        let mut res = [0u8; 64];
-        res[0..32].copy_from_slice(&xbn.to_vec_padded(32).unwrap());
-        res[32..].copy_from_slice(&ybn.to_vec_padded(32).unwrap());
-        res
+        let point = public_point(&self.attest_key);
+        point[1..].try_into().expect("uncompressed P-256 point")
     }
 }
 
@@ -102,16 +85,13 @@ impl Default for SigningInfo {
         let tcb_issuer_chain = root.issue_chain(&["Intel SGX TCB Signing"]);
         let qe_id_issuer_chain = root.issue_chain(&["Intel SGX TCB Signing"]);
 
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let attest_key = EcKey::generate(&group).unwrap();
-
         Self {
             root,
             pck_chain,
             pck_issuer_crl_chain,
             tcb_issuer_chain,
             qe_id_issuer_chain,
-            attest_key,
+            attest_key: generate_key(),
             root_revoked: Vec::new(),
             pck_revoked: Vec::new(),
         }
@@ -119,7 +99,7 @@ impl Default for SigningInfo {
 }
 
 pub(crate) struct FakeAttestation {
-    pub root_key: PKey<Public>,
+    pub root_key: PublicKey,
     pub evidence: Evidence<'static>,
     pub endorsements: SgxEndorsements,
 }
@@ -166,11 +146,6 @@ pub(crate) struct FakeAttestationBuilder {
 }
 
 impl FakeAttestationBuilder {
-    fn sign_data(data: &[u8], key: &EcKeyRef<Private>) -> EcdsaSig {
-        let hash = boring_signal::hash::hash(MessageDigest::sha256(), data).unwrap();
-        EcdsaSig::sign(&hash, key).unwrap()
-    }
-
     /// Create Evidence/Endorsements that have the appropriate report signatures, and QE report data
     ///
     /// Note that this will overwrite any manually set. If you'd like to test a corrupt signature,
@@ -184,11 +159,10 @@ impl FakeAttestationBuilder {
             .qe_report_body
             .sgx_report_data_bytes = [0; 64];
         let hash = {
-            let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
-            h.update(&self.uevidence.quote.support.attest_pub_key)
-                .unwrap();
-            h.update(self.uevidence.quote.support.auth_data).unwrap();
-            h.finish().unwrap()
+            let mut h = sha2::Sha256::new();
+            h.update(self.uevidence.quote.support.attest_pub_key);
+            h.update(self.uevidence.quote.support.auth_data);
+            h.finalize()
         };
         self.uevidence
             .quote
@@ -197,12 +171,14 @@ impl FakeAttestationBuilder {
             .sgx_report_data_bytes[0..32]
             .copy_from_slice(&hash);
 
-        self.uevidence.quote.support.isv_signature =
-            Self::sign_data(self.uevidence.quote.data(), &self.signing_info.attest_key);
-        self.uevidence.quote.support.qe_report_signature = Self::sign_data(
+        self.uevidence.quote.support.isv_signature = EcdsaSignature(sign_fixed(
+            &self.signing_info.attest_key,
+            self.uevidence.quote.data(),
+        ));
+        self.uevidence.quote.support.qe_report_signature = EcdsaSignature(sign_fixed(
+            &self.signing_info.pck_chain[0].key,
             self.uevidence.quote.support.data(),
-            &self.signing_info.pck_chain[0].pkey.ec_key().unwrap(),
-        );
+        ));
 
         self.uendorsements.root_crl = self.signing_info.root_crl();
         self.uendorsements.pck_issuer_crl = self.signing_info.pck_crl();
@@ -210,32 +186,32 @@ impl FakeAttestationBuilder {
             self.signing_info
                 .qe_id_issuer_chain
                 .into_iter()
-                .map(|tc| tc.x509)
+                .map(|tc| tc.cert)
                 .collect(),
         );
         self.uendorsements.tcb_issuer_chain = CertChain::from_certs(
             self.signing_info
                 .tcb_issuer_chain
                 .into_iter()
-                .map(|tc| tc.x509)
+                .map(|tc| tc.cert)
                 .collect(),
         );
         self.uendorsements.pck_issuer_crl_chain = CertChain::from_certs(
             self.signing_info
                 .pck_issuer_crl_chain
                 .into_iter()
-                .map(|tc| tc.x509)
+                .map(|tc| tc.cert)
                 .collect(),
         );
         self.uevidence.quote.support.pck_cert_chain = CertChain::from_certs(
             self.signing_info
                 .pck_chain
                 .into_iter()
-                .map(|tc| tc.x509)
+                .map(|tc| tc.cert)
                 .collect(),
         );
         FakeAttestation {
-            root_key: self.signing_info.root.x509.public_key().unwrap(),
+            root_key: self.signing_info.root.cert.public_key().unwrap(),
             evidence: self.uevidence,
             endorsements: self.uendorsements,
         }

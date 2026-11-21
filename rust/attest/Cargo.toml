@@ -23,14 +23,14 @@ libsignal-core = { workspace = true }
 asn1 = { workspace = true }
 bitflags = { workspace = true }
 blake2 = { workspace = true }
-boring-signal = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 ciborium = { workspace = true }
 const-str = { workspace = true }
+der = { workspace = true, features = ["alloc", "derive", "oid", "pem"] }
 displaydoc = { workspace = true }
+graviola = { workspace = true }
 hex = { workspace = true, features = ["serde"] }
-libc = { workspace = true }
 libcrux-ml-kem = { workspace = true, features = ["mlkem1024"] }
 log = { workspace = true }
 prost = { workspace = true }
@@ -45,11 +45,13 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 x25519-dalek = { workspace = true }
+x509-cert = { workspace = true }
 zerocopy = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
-snow = { workspace = true, default-features = true }
+# The default resolver for the test servers, without `std`, which would pull in ring.
+snow = { workspace = true, features = ["default-resolver-crypto"] }
 
 [build-dependencies]
 prost-build = { workspace = true }

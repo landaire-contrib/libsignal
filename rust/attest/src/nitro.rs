@@ -5,21 +5,17 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use boring_signal::bn::BigNum;
-use boring_signal::ecdsa::EcdsaSig;
-use boring_signal::stack;
-use boring_signal::x509::store::X509StoreBuilder;
-use boring_signal::x509::{X509, X509StoreContext};
 use ciborium::value::{Integer, Value};
 use prost::{DecodeError, Message};
-use sha2::{Digest, Sha384};
 use subtle::ConstantTimeEq;
 
+use crate::cert_chain::{CertChain, Revocation, TrustStore};
 use crate::constants::NITRO_EXPECTED_PCRS;
 use crate::enclave::{self, Claims, Handshake, HandshakeType};
 use crate::proto;
 use crate::svr2::RaftConfig;
 use crate::util::SmallMap;
+use crate::x509::{Certificate, SignatureEncoding, SignatureHash};
 
 // A type for Platform Configuration Register values
 // They are Sha-384 hashes, 48 byte long.
@@ -98,12 +94,6 @@ impl From<ciborium::de::Error<std::io::Error>> for NitroError {
     }
 }
 
-impl From<boring_signal::error::ErrorStack> for NitroError {
-    fn from(err: boring_signal::error::ErrorStack) -> NitroError {
-        NitroError::InvalidCertificate(err.to_string())
-    }
-}
-
 impl From<DecodeError> for NitroError {
     fn from(_err: DecodeError) -> Self {
         NitroError::InvalidUserData
@@ -123,21 +113,18 @@ impl CoseSign1 {
     }
 
     pub fn extract_attestation_doc(&self, now: SystemTime) -> Result<AttestationDoc, NitroError> {
-        let hash = Sha384::digest(self.to_canonical());
-        let r = BigNum::from_slice(&self.signature[..48]).expect("can extract r");
-        let s = BigNum::from_slice(&self.signature[48..]).expect("can extract s");
-        let sig = EcdsaSig::from_private_components(r, s).expect("can initialize signature");
-
         let doc = AttestationDoc::from_bytes(self.payload.as_slice()).expect("can parse doc");
         let cert = doc.verified_cert(now)?;
         let key = cert
             .public_key()
-            .and_then(|pub_key| pub_key.ec_key())
-            .expect("has EC key");
-        let is_valid = sig.verify(hash.as_slice(), &key).expect("can verify");
-        if !is_valid {
-            return Err(NitroError::InvalidSignature);
-        }
+            .map_err(|e| NitroError::InvalidCertificate(e.to_string()))?;
+        key.verify(
+            SignatureHash::Sha384,
+            SignatureEncoding::Fixed,
+            &self.to_canonical(),
+            &self.signature,
+        )
+        .map_err(|_| NitroError::InvalidSignature)?;
         Ok(doc)
     }
 
@@ -364,33 +351,34 @@ impl AttestationDoc {
         })
     }
 
-    fn verified_cert(&self, now: SystemTime) -> Result<X509, NitroError> {
-        let mut context = X509StoreContext::new()?;
-        let certificate = X509::from_der(&self.certificate)?;
-        let mut stack = stack::Stack::<X509>::new()?;
-        for der in self.cabundle.iter() {
-            let cert = X509::from_der(der)?;
-            stack.push(cert)?;
+    fn verified_cert(&self, now: SystemTime) -> Result<Certificate, NitroError> {
+        fn invalid(reason: impl std::fmt::Display) -> NitroError {
+            NitroError::InvalidCertificate(reason.to_string())
         }
-        let stack = stack;
-        let trust = {
-            let root = X509::from_pem(ROOT_CERTIFICATE_PEM)?;
-            let mut builder = X509StoreBuilder::new()?;
-            builder.param_mut().set_time(
-                now.duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("current time is after 1970")
-                    .as_secs()
-                    .try_into()
-                    .expect("haven't yet overflowed time_t"),
-            );
-            builder.add_cert(root)?;
-            builder.build()
-        };
-        let result = context.init(&trust, &certificate, &stack, |ctx| {
-            ctx.verify_cert()?;
-            Ok(ctx.verify_result())
-        })?;
-        result.map_err(|e| NitroError::InvalidCertificate(e.to_string()))?;
+
+        let root = Certificate::from_pem_chain(ROOT_CERTIFICATE_PEM)
+            .map_err(invalid)?
+            .pop()
+            .ok_or_else(|| invalid("missing root certificate"))?;
+        let certificate = Certificate::from_der(self.certificate.clone()).map_err(invalid)?;
+
+        let mut certs = vec![certificate.clone()];
+        for der in &self.cabundle {
+            certs.push(Certificate::from_der(der.clone()).map_err(invalid)?);
+        }
+        // The bundle normally starts with the root. Without it, the chain ends at the trusted
+        // copy.
+        if !certs.iter().any(|cert| cert.der() == root.der()) {
+            certs.push(root.clone());
+        }
+
+        let chain = CertChain::new(certs).map_err(invalid)?;
+        if chain.leaf().der() != certificate.der() {
+            return Err(invalid("certificate is not the leaf of the bundle"));
+        }
+        let trust = TrustStore::new(&root, Revocation::NotChecked, now);
+        chain.validate_path(&trust, &[]).map_err(invalid)?;
+
         Ok(certificate)
     }
 
